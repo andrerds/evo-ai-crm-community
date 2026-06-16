@@ -316,38 +316,36 @@ module Whatsapp::EvolutionGoHandlers::MessagesUpsert
   end
 
   def extract_media_url
-    # Evolution Go provides processed mediaUrl directly at Message level
+    # Evolution Go may expose the media URL at different paths depending on the
+    # webhook payload variant:
+    #   * legacy/transcoded payloads: `mediaUrl` at the Message root or inside the
+    #     specific *Message sub-objects (camelCase, already-downloadable URL).
+    #   * raw whatsmeow payloads (issue #119): `URL` (uppercase) inside the specific
+    #     *Message sub-objects, pointing at encrypted whatsapp.net media that needs
+    #     decryption via the Evolution GO `/message/downloadmedia` endpoint.
     message = @evolution_go_message
     Rails.logger.info 'Evolution Go API: Extracting media URL from message'
     Rails.logger.info "Evolution Go API: Message structure for media: #{message&.keys}"
     return nil unless message
 
-    # Evolution Go structure has mediaUrl at the root Message level
     media_url = message[:mediaUrl]
     Rails.logger.info "Evolution Go API: Root level mediaUrl: #{media_url}"
 
-    # Fallback: check inside specific message types if not found at root
     if media_url.blank?
-      Rails.logger.info 'Evolution Go API: Checking inside specific message types for mediaUrl'
+      Rails.logger.info 'Evolution Go API: Checking inside specific message types for mediaUrl/URL'
 
-      image_url = message.dig(:imageMessage, :mediaUrl)
-      video_url = message.dig(:videoMessage, :mediaUrl)
-      audio_url = message.dig(:audioMessage, :mediaUrl)
-      doc_url = message.dig(:documentMessage, :mediaUrl)
-      sticker_url = message.dig(:stickerMessage, :mediaUrl)
-
-      Rails.logger.info "Evolution Go API: imageMessage.mediaUrl: #{image_url}"
-      Rails.logger.info "Evolution Go API: videoMessage.mediaUrl: #{video_url}"
-      Rails.logger.info "Evolution Go API: audioMessage.mediaUrl: #{audio_url}"
-      Rails.logger.info "Evolution Go API: documentMessage.mediaUrl: #{doc_url}"
-      Rails.logger.info "Evolution Go API: stickerMessage.mediaUrl: #{sticker_url}"
-
-      media_url = image_url || video_url || audio_url || doc_url || sticker_url
+      media_url = MEDIA_MESSAGE_TYPES.each_with_object(nil) do |type, _acc|
+        candidate = message.dig(type, :mediaUrl).presence || message.dig(type, :URL).presence
+        Rails.logger.info "Evolution Go API: #{type}.mediaUrl/URL: #{candidate}"
+        break candidate if candidate.present?
+      end
     end
 
     Rails.logger.info "Evolution Go API: Final extracted media URL: #{media_url}"
     media_url
   end
+
+  MEDIA_MESSAGE_TYPES = %i[imageMessage videoMessage audioMessage documentMessage stickerMessage].freeze
 
   def extract_filename_from_url(url)
     # Try to extract filename from URL
@@ -483,6 +481,15 @@ module Whatsapp::EvolutionGoHandlers::MessagesUpsert
   def download_attachment_file
     media_url = extract_media_url
 
+    # whatsapp.net URLs come from the raw whatsmeow payload and are AES-encrypted
+    # with the per-message mediaKey. Plain HTTP download yields a useless ciphertext,
+    # so route them through the Evolution GO `/message/downloadmedia` endpoint which
+    # decrypts using the same instance's session keys.
+    if media_url.present? && encrypted_whatsapp_media?(media_url)
+      decrypted = download_via_evolution_go_api
+      return decrypted if decrypted
+    end
+
     if media_url.present?
       Rails.logger.info "Evolution Go API: Downloading from mediaUrl: #{media_url}"
       return Down.download(media_url)
@@ -491,12 +498,7 @@ module Whatsapp::EvolutionGoHandlers::MessagesUpsert
     base64_data = @evolution_go_message&.dig(:base64)
     if base64_data.present?
       Rails.logger.info 'Evolution Go API: Decoding base64 media'
-      decoded = Base64.decode64(base64_data)
-      tmp = Tempfile.new(['evo_media', ".#{media_extension}"])
-      tmp.binmode
-      tmp.write(decoded)
-      tmp.rewind
-      return tmp
+      return tempfile_from_base64(base64_data)
     end
 
     Rails.logger.warn 'Evolution Go API: No media found - no mediaUrl or base64'
@@ -504,6 +506,60 @@ module Whatsapp::EvolutionGoHandlers::MessagesUpsert
   rescue StandardError => e
     Rails.logger.error "Evolution Go API: Failed to download media: #{e.message}"
     nil
+  end
+
+  def encrypted_whatsapp_media?(url)
+    URI.parse(url).host.to_s.end_with?('whatsapp.net')
+  rescue URI::InvalidURIError
+    false
+  end
+
+  def download_via_evolution_go_api
+    api_url = whatsapp_channel.provider_config['api_url'].presence ||
+              GlobalConfigService.load('EVOLUTION_GO_API_URL', '').to_s.strip
+    instance_token = whatsapp_channel.provider_config['instance_token']
+
+    if api_url.blank? || instance_token.blank?
+      Rails.logger.warn 'Evolution Go API: Cannot fetch encrypted media — api_url or instance_token missing'
+      return nil
+    end
+
+    endpoint = "#{api_url.chomp('/')}/message/downloadmedia"
+    Rails.logger.info "Evolution Go API: Requesting decrypted media via #{endpoint}"
+
+    response = HTTParty.post(
+      endpoint,
+      headers: { 'apikey' => instance_token, 'Content-Type' => 'application/json' },
+      body: { message: @evolution_go_message }.to_json,
+      timeout: 60
+    )
+
+    unless response.success?
+      Rails.logger.error "Evolution Go API: downloadmedia failed (#{response.code}): #{response.body.to_s.truncate(200)}"
+      return nil
+    end
+
+    base64_payload = response.parsed_response.dig('data', 'base64')
+    if base64_payload.blank?
+      Rails.logger.error 'Evolution Go API: downloadmedia returned empty base64 payload'
+      return nil
+    end
+
+    # Strip the data-URL prefix (`data:<mimetype>;base64,`) if present.
+    base64_payload = base64_payload.split(',', 2).last if base64_payload.start_with?('data:')
+    tempfile_from_base64(base64_payload)
+  rescue StandardError => e
+    Rails.logger.error "Evolution Go API: downloadmedia request errored: #{e.message}"
+    nil
+  end
+
+  def tempfile_from_base64(base64_payload)
+    decoded = Base64.decode64(base64_payload)
+    tmp = Tempfile.new(['evo_media', ".#{media_extension}"])
+    tmp.binmode
+    tmp.write(decoded)
+    tmp.rewind
+    tmp
   end
 
   def media_extension
