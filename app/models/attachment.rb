@@ -55,6 +55,11 @@ class Attachment < ApplicationRecord
 
   # NOTE: the URl returned does a 301 redirect to the actual file
   def file_url
+    # `url_for` relies on ActiveStorage::Current.url_options, which is set per web
+    # request but is blank inside the ActionCable broadcast Sidekiq job. Without it
+    # the live `message.created` push carries an empty/relative data_url and the
+    # attachment renders blank until an F5 refetch (web request) populates it.
+    ActiveStorage::Current.url_options = Rails.application.routes.default_url_options if ActiveStorage::Current.url_options.blank?
     file.attached? ? url_for(file) : ''
   end
 
@@ -65,6 +70,7 @@ class Attachment < ApplicationRecord
   end
 
   def thumb_url
+    ActiveStorage::Current.url_options = Rails.application.routes.default_url_options if ActiveStorage::Current.url_options.blank?
     if file.attached? && file.representable?
       url_for(file.representation(resize_to_fill: [250, nil]))
     else
