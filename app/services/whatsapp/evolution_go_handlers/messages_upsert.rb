@@ -217,6 +217,9 @@ module Whatsapp::EvolutionGoHandlers::MessagesUpsert
     # Handle media attachment if needed
     handle_attach_media if attach_media
 
+    # Persist shared-contact (vCard) data so the bubble isn't empty
+    handle_contacts if message_type == 'contacts'
+
     # Save message
     @message.save!
 
@@ -300,6 +303,14 @@ module Whatsapp::EvolutionGoHandlers::MessagesUpsert
 
     # Empty content for media without caption
     return '' if media_message?
+
+    # Shared contact: surface the contact name as the bubble text
+    contact = message[:contactMessage] || message.dig(:contactsArrayMessage, :contacts)&.first
+    if contact
+      return contact[:displayName].presence ||
+             contact[:vcard]&.match(/FN:(.+)/i)&.[](1)&.strip ||
+             'Contact'
+    end
 
     nil
   end
